@@ -12,15 +12,15 @@ class Indexer:
         # Load API key from d:/BookExpert/google.apikey
         try:
             with open("d:/BookExpert/google.apikey", "r", encoding="utf-8") as f:
-                self.api_key = f.read().strip()
+                self.api_key = f.read().strip().rstrip(".")
                 os.environ["GOOGLE_API_KEY"] = self.api_key
         except Exception as e:
             logger.error("Could not read google.apikey")
             raise e
             
-        logger.info("Initializing Google Generative AI Embeddings")
+        logger.info("Initializing Google Generative AI Embeddings (gemini-embedding-001)")
         self.embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/text-embedding-004",
+            model="models/gemini-embedding-001",
             google_api_key=self.api_key
         )
         

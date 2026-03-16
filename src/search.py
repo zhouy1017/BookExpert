@@ -47,7 +47,7 @@ class HybridSearcher:
         if not self.qclient.collection_exists(self.collection_name):
             self.qclient.create_collection(
                 collection_name=self.collection_name,
-                vectors_config=VectorParams(size=768, distance=Distance.COSINE)
+                vectors_config=VectorParams(size=3072, distance=Distance.COSINE)
             )
 
     def _load_bm25(self):
@@ -123,13 +123,14 @@ class HybridSearcher:
         if not self.bm25_corpus_ids or self.bm25 is None:
             return []
             
-        # 1. Vector Search
+        # 1. Vector Search using the modern query_points API
         query_vector = self.indexer.embed_query(query)
-        qdrant_results = self.qclient.search(
+        qdrant_response = self.qclient.query_points(
             collection_name=self.collection_name,
-            query_vector=query_vector,
-            limit=limit * 2 # get more candidates
+            query=query_vector,
+            limit=limit * 2  # get more candidates for RRF
         )
+        qdrant_results = qdrant_response.points
         
         # Rank dict: chunk_id -> rank score
         rrf_scores: Dict[str, float] = {}
