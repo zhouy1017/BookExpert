@@ -1,0 +1,27 @@
+# Web Framework & UI
+streamlit>=1.30.0
+fastapi>=0.109.2
+uvicorn>=0.27.1
+python-multipart>=0.0.9
+
+# LangChain & LLMs
+langchain>=0.1.5
+langchain-core>=0.1.18
+langchain-community>=0.0.18
+langchain-openai>=0.0.5
+langchain-google-genai>=0.0.8
+tiktoken>=0.5.2
+
+# Document Processing
+pymupdf>=1.23.21  # For fast PDF parsing
+python-docx>=1.1.0 # For DOCX parsing
+pywin32>=306  # For DOC to DOCX conversion on Windows
+
+# Databases
+qdrant-client>=1.7.3 # Vector Database
+SQLAlchemy>=2.0.25 # Metadata DB
+
+# Utilities
+python-dotenv>=1.0.1
+pydantic>=2.6.0
+loguru>=0.7.2
