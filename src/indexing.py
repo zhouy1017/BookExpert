@@ -5,7 +5,12 @@ import logging
 from typing import List
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
+from src.rate_limiter import GOOGLE_LIMITER, retry_on_rate_limit
+
 logger = logging.getLogger(__name__)
+
+# How many texts to embed per single API call (keeps request payloads small)
+_EMBED_BATCH_SIZE = 5
 
 class Indexer:
     def __init__(self):
@@ -17,16 +22,33 @@ class Indexer:
         except Exception as e:
             logger.error("Could not read google.apikey")
             raise e
-            
+
         logger.info("Initializing Google Generative AI Embeddings (gemini-embedding-001)")
         self.embeddings = GoogleGenerativeAIEmbeddings(
             model="models/gemini-embedding-001",
             google_api_key=self.api_key
         )
-        
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        logger.info(f"Generating embeddings for {len(texts)} chunks")
+
+    @retry_on_rate_limit(max_attempts=6, wait_min=5, wait_max=90)
+    def _embed_batch(self, texts: List[str]) -> List[List[float]]:
+        """Embed a small batch — the rate limiter waits before the call."""
+        GOOGLE_LIMITER.wait()
         return self.embeddings.embed_documents(texts)
-        
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """Split texts into small batches, rate-limit between each batch."""
+        logger.info(f"Generating embeddings for {len(texts)} chunks "
+                    f"(batches of {_EMBED_BATCH_SIZE}, ~{60/_EMBED_BATCH_SIZE:.0f}s/batch at 15 RPM)")
+        all_vectors: List[List[float]] = []
+        for i in range(0, len(texts), _EMBED_BATCH_SIZE):
+            batch = texts[i:i + _EMBED_BATCH_SIZE]
+            vectors = self._embed_batch(batch)
+            all_vectors.extend(vectors)
+            logger.info(f"  Embedded {min(i + _EMBED_BATCH_SIZE, len(texts))}/{len(texts)} chunks")
+        return all_vectors
+
+    @retry_on_rate_limit(max_attempts=6, wait_min=5, wait_max=60)
     def embed_query(self, query: str) -> List[float]:
+        """Embed a single query string with rate limiting."""
+        GOOGLE_LIMITER.wait()
         return self.embeddings.embed_query(query)

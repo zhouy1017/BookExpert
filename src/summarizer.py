@@ -6,6 +6,8 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
+from src.rate_limiter import DEEPSEEK_LIMITER, retry_on_rate_limit
+
 logger = logging.getLogger(__name__)
 
 # Truncate individual chunks for the map step to avoid hitting context window limits
@@ -69,7 +71,7 @@ class BookSummarizer:
             batch = texts[i:i + batch_size]
             for chunk in batch:
                 truncated = chunk[:_MAX_CHUNK_CHARS]
-                summary = self.map_chain.invoke({"chunk": truncated})
+                summary = self._invoke_map(truncated)
                 intermediate_summaries.append(summary)
             logger.info(f"  Mapped {min(i + batch_size, len(texts))}/{len(texts)} chunks.")
 
@@ -81,7 +83,7 @@ class BookSummarizer:
             for i in range(0, len(intermediate_summaries), batch_size):
                 batch = intermediate_summaries[i:i + batch_size]
                 combined = "\n\n".join([f"[Segment {i + j + 1}]: {s}" for j, s in enumerate(batch)])
-                reduced = self.reduce_chain.invoke({"summaries": combined})
+                reduced = self._invoke_reduce(combined)
                 next_level.append(reduced)
             intermediate_summaries = next_level
             logger.info(f"  Reduce pass produced {len(intermediate_summaries)} summaries.")
@@ -99,4 +101,22 @@ class BookSummarizer:
         ])
 
         logger.info(f"Answering question based on {len(context_chunks)} retrieved chunks.")
-        return self.qa_chain.invoke({"context": context_str, "question": query})
+        return self._invoke_qa(context_str, query)
+
+    # ------------------------------------------------------------------
+    # Internal rate-limited + retry-wrapped LLM invocations
+    # ------------------------------------------------------------------
+    @retry_on_rate_limit(max_attempts=6, wait_min=5, wait_max=90)
+    def _invoke_map(self, chunk: str) -> str:
+        DEEPSEEK_LIMITER.wait()
+        return self.map_chain.invoke({"chunk": chunk})
+
+    @retry_on_rate_limit(max_attempts=6, wait_min=5, wait_max=90)
+    def _invoke_reduce(self, summaries: str) -> str:
+        DEEPSEEK_LIMITER.wait()
+        return self.reduce_chain.invoke({"summaries": summaries})
+
+    @retry_on_rate_limit(max_attempts=6, wait_min=5, wait_max=90)
+    def _invoke_qa(self, context: str, question: str) -> str:
+        DEEPSEEK_LIMITER.wait()
+        return self.qa_chain.invoke({"context": context, "question": question})
