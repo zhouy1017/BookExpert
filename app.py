@@ -11,7 +11,7 @@ import src.indexing_queue as iq
 from src.cache import EmbeddingCache, FeedbackCache, SummaryCache
 from src.chunking import ChineseTextSplitter
 from src.extractors import DocumentProcessor
-from src.rate_limiter import DEEPSEEK_LIMITER, GEMINI_EMBEDDING_LIMITER, is_quota_error
+from src.rate_limiter import DEEPSEEK_LIMITER, GEMINI_EMBEDDING_LIMITER, GEMINI_LLM_LIMITER, is_quota_error
 from src.reviewer import BookReviewer
 from src.search import HybridSearcher
 from src.summarizer import BookSummarizer
@@ -150,8 +150,21 @@ def _render_quota_toolbar():
 
         st.divider()
 
+        # ── Gemini LLM ─────────────────────────────────────────────
+        gl_status = GEMINI_LLM_LIMITER.get_status()
+        st.caption("**Gemini LLM（主对话模型 gemini-3.1-flash-lite）**")
+        gl_pct  = gl_status["pct_used"]
+        gl_icon = "🔴" if gl_pct >= 0.85 else ("🟡" if gl_pct >= 0.60 else "🟢")
+        st.markdown(
+            f"{gl_icon} **RPM** {gl_status['rpm_remaining']}/{gl_status['rpm_limit']} 剩余"
+            f"（已用 {gl_status['rpm_used']}）"
+        )
+        st.progress(min(gl_pct, 1.0))
+
+        st.divider()
+
         # ── DeepSeek LLM ───────────────────────────────────────────
-        st.caption("**DeepSeek LLM（对话模型）**")
+        st.caption("**DeepSeek LLM（备用对话模型）**")
         rpm_used = d_status["rpm_used"]
         rpm_lim  = d_status["rpm_limit"]
         rpm_rem  = d_status["rpm_remaining"]
@@ -159,6 +172,19 @@ def _render_quota_toolbar():
         icon     = "🔴" if pct >= 0.85 else ("🟡" if pct >= 0.60 else "🟢")
         st.markdown(f"{icon} **RPM** {rpm_rem}/{rpm_lim} 剩余（已用 {rpm_used}）")
         st.progress(min(pct, 1.0))
+
+        st.caption("ℹ️ 数字为本次会话估算值。如遇额度异常，可手动重置计数器。")
+        if st.button("🔄 重置本地计数器", key="_quota_reset"):
+            for bucket in [GEMINI_EMBEDDING_LIMITER._primary, GEMINI_EMBEDDING_LIMITER._fallback]:
+                with bucket._lock:
+                    bucket._req_times.clear()
+                    bucket._tok_log.clear()
+                    bucket._day_count = 0
+            for lim in [DEEPSEEK_LIMITER, GEMINI_LLM_LIMITER]:
+                with lim._lock:
+                    lim._window.clear()
+            st.toast("✅ 本地计数器已重置", icon="🔄")
+            st.rerun()
 
 
 
@@ -281,6 +307,37 @@ def main():
 
         # ── Indexing Queue Progress ───────
         _render_indexing_queue_sidebar()
+
+        st.divider()
+        with st.expander("🗑 危险区域 — 清理数据", expanded=False):
+            st.warning("以下操作将 **永久** 删除所有本地缓存、嵌入向量及书评数据！")
+            if "confirm_clear" not in st.session_state:
+                st.session_state.confirm_clear = False
+            if not st.session_state.confirm_clear:
+                if st.button("🗑 清理所有缓存与索引", key="_danger_clear_btn"):
+                    st.session_state.confirm_clear = True
+                    st.rerun()
+            else:
+                st.error("⚠️ 确认清理？所有书籍索引、摘要和书评缓存将被删除！")
+                c1, c2 = st.columns(2)
+                if c1.button("✅ 确认清理", key="_confirm_yes"):
+                    try:
+                        get_emb_cache().clear_all()
+                        get_sum_cache().clear_all()
+                        get_fb_cache().clear_all()
+                        get_searcher().clear_all_documents()
+                        keep_keys = {"conversations", "active_conv_id", "conv_counter"}
+                        for k in list(st.session_state.keys()):
+                            if k not in keep_keys:
+                                del st.session_state[k]
+                        st.session_state.confirm_clear = False
+                        st.toast("✅ 所有缓存和索引已清空。", icon="🗑")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"清理出错：{e}")
+                if c2.button("❌ 取消", key="_confirm_no"):
+                    st.session_state.confirm_clear = False
+                    st.rerun()
 
         # ── Indexed Document List ─────────
         st.header("📚 已索引文档")
@@ -469,18 +526,28 @@ def main():
                         st.warning("该书仍在索引中，请等待索引完成后再生成摘要。")
                     else:
                         try:
-                            with st.spinner(f"正在为《{selected_doc}》进行 RAG 检索 + Map-Reduce 摘要…"):
-                                summary = summarizer.rag_summarize(
-                                    doc_name=selected_doc,
-                                    searcher=searcher,
-                                    file_hash=dh,
-                                    summary_cache=sum_cache,
-                                )
+                            _pb  = st.progress(0, text="准备 RAG 检索…")
+                            _lbl = st.empty()
+
+                            def _on_rag_progress(step: int, total: int, label: str):
+                                pct = int(step / max(total, 1) * 100)
+                                _pb.progress(pct, text=f"{pct}%  {label}")
+                                _lbl.caption(label)
+
+                            summary = summarizer.rag_summarize(
+                                doc_name=selected_doc,
+                                searcher=searcher,
+                                file_hash=dh,
+                                summary_cache=sum_cache,
+                                progress_callback=_on_rag_progress,
+                            )
+                            _pb.empty()
+                            _lbl.empty()
                             st.markdown("### 全书摘要")
                             st.write(summary)
                         except Exception as e:
                             if is_quota_error(e):
-                                st.toast("🚫 Gemini 嵌入 API 配额已耗尽，摄要失败。", icon="⚠️")
+                                st.toast("🚫 Gemini 嵌入 API 配额已耗尽，摘要失败。", icon="⚠️")
                                 st.error(f"摘要失败：Gemini 或 DeepSeek API 配额不足。\n详情：{e}")
                             else:
                                 st.toast("摘要生成出错。", icon="❌")
@@ -672,30 +739,30 @@ def main():
                             on_change=_on_dim_changed,
                         )
 
-                    # ── Text feedback fields ──────────────────────────────────
-                    fb_strengths  = st.text_area(
-                        "补充优点（每行一条）",
-                        value="\n".join(existing_fb.get("extra_strengths", [])),
-                        key=f"_fb_str_{dh}",
-                    )
-                    fb_weaknesses = st.text_area(
-                        "补充不足（每行一条）",
-                        value="\n".join(existing_fb.get("extra_weaknesses", [])),
-                        key=f"_fb_wk_{dh}",
-                    )
-                    fb_comment = st.text_area(
-                        "对书评的意见或补充",
-                        value=existing_fb.get("user_comments", ""),
-                        key=f"_fb_cmt_{dh}",
-                    )
+                    # ── Text feedback fields ──────────────────────────────────────
+                    ss_str = f"_fb_str_{dh}"
+                    ss_wk  = f"_fb_wk_{dh}"
+                    ss_cmt = f"_fb_cmt_{dh}"
+                    # Seed session state from saved feedback on first render
+                    if ss_str not in st.session_state:
+                        st.session_state[ss_str] = "\n".join(existing_fb.get("extra_strengths", []))
+                    if ss_wk  not in st.session_state:
+                        st.session_state[ss_wk]  = "\n".join(existing_fb.get("extra_weaknesses", []))
+                    if ss_cmt not in st.session_state:
+                        st.session_state[ss_cmt] = existing_fb.get("user_comments", "")
+
+                    st.text_area("补充优点（每行一条）", key=ss_str)
+                    st.text_area("补充不足（每行一条）", key=ss_wk)
+                    st.text_area("对书评的意见或补充",   key=ss_cmt)
 
                     if st.button("🔄 根据反馈重新生成书评", key=f"_fb_submit_{dh}"):
-                        # Read current slider values from session state
-                        fb_overall_val  = st.session_state[ss_overall]
-                        fb_dim_vals     = {
-                            d: st.session_state[f"_fb_dim_{d}_{dh}"]
-                            for d in dim_names
-                        }
+                        # Read all current values from session state
+                        fb_overall_val = st.session_state[ss_overall]
+                        fb_dim_vals    = {d: st.session_state[f"_fb_dim_{d}_{dh}"] for d in dim_names}
+                        fb_str_val     = st.session_state.get(ss_str, "")
+                        fb_wk_val      = st.session_state.get(ss_wk,  "")
+                        fb_cmt_val     = st.session_state.get(ss_cmt, "")
+
                         dim_deltas = [
                             f"{d}调整为{fb_dim_vals[d]}分"
                             for d, orig in dims.items()
@@ -708,24 +775,32 @@ def main():
                                 "overall_score": fb_overall_val,
                                 "dimensions":    fb_dim_vals,
                             },
-                            "extra_strengths":  [s.strip() for s in fb_strengths.splitlines() if s.strip()],
-                            "extra_weaknesses": [w.strip() for w in fb_weaknesses.splitlines() if w.strip()],
-                            "user_comments":    fb_comment,
+                            "extra_strengths":  [s.strip() for s in fb_str_val.splitlines() if s.strip()],
+                            "extra_weaknesses": [w.strip() for w in fb_wk_val.splitlines() if w.strip()],
+                            "user_comments":    fb_cmt_val,
                             "scoring_prefs":    auto_prefs,
                         }
                         fb_cache.save_feedback(dh, feedback_data)
 
-                        with st.spinner("根据您的反馈重新生成书评中…"):
-                            review_data = reviewer.regenerate_with_feedback(
-                                searcher=searcher,
-                                doc_name=selected_doc,
-                                file_hash=dh,
-                                feedback=feedback_data,
-                                scoring_prefs=auto_prefs,
-                                summary_cache=sum_cache,
-                            )
-                        st.success("✅ 您的调整已记忆，将用于后续书评参考。")
-                        st.rerun()
+                        try:
+                            with st.spinner("根据您的反馈重新生成书评中…"):
+                                review_data = reviewer.regenerate_with_feedback(
+                                    searcher=searcher,
+                                    doc_name=selected_doc,
+                                    file_hash=dh,
+                                    feedback=feedback_data,
+                                    scoring_prefs=auto_prefs,
+                                    summary_cache=sum_cache,
+                                )
+                            st.success("✅ 您的调整已记忆，将用于后续书评参考。")
+                            st.rerun()
+                        except Exception as e:
+                            if is_quota_error(e):
+                                st.toast("🚫 API 配额已耗尽，重编书评失败。", icon="⚠️")
+                                st.error(f"重编书评失败：API 配额不足。\n{e}")
+                            else:
+                                st.toast("重编书评出错。", icon="❌")
+                                st.error(f"错误：{e}")
 
 
 

@@ -75,6 +75,13 @@ class EmbeddingCache:
             ).fetchone()[0]
         return count >= total_chunks
 
+    def clear_all(self):
+        """Truncate all cached embeddings."""
+        with self._lock:
+            self._conn.execute("DELETE FROM embedding_cache")
+            self._conn.commit()
+        logger.info("EmbeddingCache: cleared all entries.")
+
 
 # ---------------------------------------------------------------------------
 # Summary / Review Cache
@@ -129,6 +136,13 @@ class SummaryCache:
 
     def save_scores(self, file_hash: str, scores: Dict):
         self.put(f"scores_{file_hash}", json.dumps(scores, ensure_ascii=False))
+
+    def clear_all(self):
+        """Truncate all cached summaries, reviews, and score records."""
+        with self._lock:
+            self._conn.execute("DELETE FROM summary_cache")
+            self._conn.commit()
+        logger.info("SummaryCache: cleared all entries.")
 
 
 # ---------------------------------------------------------------------------
@@ -197,3 +211,10 @@ class FeedbackCache:
                 datetime.utcnow().isoformat(),
             ))
             self._conn.commit()
+
+    def clear_all(self):
+        """Truncate all stored user feedback."""
+        with self._lock:
+            self._conn.execute("DELETE FROM user_review_feedback")
+            self._conn.commit()
+        logger.info("FeedbackCache: cleared all entries.")

@@ -1,10 +1,11 @@
 """
 Book Review System — RAG-first, professional critic quality
 ============================================================
-Uses DeepSeek to generate a structured 100-point critic review for an indexed
-book. Retrieves content exclusively from the indexed corpus via HybridSearcher
-(never re-reads raw files). Scores are locked after first generation to ensure
-consistency. Supports user-feedback-guided regeneration.
+Uses LLMProvider (Gemini Flash Lite primary, DeepSeek fallback) to generate a
+structured 100-point critic review for an indexed book. Retrieves content
+exclusively from the indexed corpus via HybridSearcher (never re-reads raw
+files). Scores are locked after first generation to ensure consistency.
+Supports user-feedback-guided regeneration.
 
 Review JSON schema
 ------------------
@@ -29,13 +30,11 @@ Review JSON schema
 
 import json
 import logging
-import os
 from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
-from src.rate_limiter import DEEPSEEK_LIMITER, retry_on_rate_limit
+from src.llm_provider import get_llm_provider
 
 logger = logging.getLogger(__name__)
 
@@ -96,20 +95,7 @@ _FEEDBACK_SYSTEM_PROMPT = """\
 
 class BookReviewer:
     def __init__(self):
-        try:
-            with open("d:/BookExpert/deepseek.apikey", "r", encoding="utf-8") as f:
-                api_key = f.read().strip().rstrip(".")
-                os.environ["DEEPSEEK_API_KEY"] = api_key
-        except Exception as e:
-            logger.error("Could not read deepseek.apikey")
-            raise e
-
-        self.llm = ChatOpenAI(
-            api_key=api_key,
-            base_url="https://api.deepseek.com",
-            model="deepseek-chat",
-            temperature=0.5,
-        )
+        self._provider = get_llm_provider(temperature=0.5)
 
     # ------------------------------------------------------------------
     # RAG chunk retrieval from indexed corpus
@@ -163,7 +149,6 @@ class BookReviewer:
         # --- Retrieve chunks from indexed corpus ---
         chunks = self._retrieve_review_chunks(searcher, doc_name)
         if not chunks:
-            # Fallback: try fetching raw stored chunks from SQLite
             chunks = searcher.get_chunks_for_doc(doc_name)[:30]
 
         if not chunks:
@@ -283,14 +268,12 @@ class BookReviewer:
             f"[摘录 {i+1}]\n{c}" for i, c in enumerate(chunks)
         )
 
-    @retry_on_rate_limit(max_attempts=5, wait_min=5, wait_max=90)
     def _invoke_review(self, system_prompt: str, human_text: str) -> str:
-        DEEPSEEK_LIMITER.wait()
         messages = [
             SystemMessage(content=system_prompt),
             HumanMessage(content=human_text),
         ]
-        return self.llm.invoke(messages).content
+        return self._provider.invoke(messages).content
 
     @staticmethod
     def _parse_review(text: str, doc_name: str) -> Dict:

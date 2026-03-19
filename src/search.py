@@ -274,3 +274,32 @@ class HybridSearcher:
                 })
 
         return final_results
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+    def clear_all_documents(self):
+        """
+        Remove ALL indexed documents from both Qdrant (vectors) and SQLite (metadata).
+        Rebuilds the BM25 index with empty state.
+        """
+        try:
+            # Drop and recreate the Qdrant collection
+            self.qclient.delete_collection(self.collection_name)
+            self._init_db()   # re-creates Qdrant collection + SQLite table
+        except Exception as e:
+            logger.warning(f"clear_all_documents: Qdrant reset warning: {e}")
+
+        try:
+            c = self.conn.cursor()
+            c.execute("DELETE FROM chunks")
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"clear_all_documents: SQLite clear error: {e}")
+
+        # Reset in-memory BM25 corpus
+        self.bm25_corpus_ids       = []
+        self.bm25_corpus_texts     = []
+        self.bm25_corpus_docnames  = []
+        self.bm25                  = None
+        logger.info("clear_all_documents: all index data cleared.")

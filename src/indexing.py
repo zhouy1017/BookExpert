@@ -51,11 +51,28 @@ class Indexer:
           1. Picks the model (primary or fallback) that has quota.
           2. Records the usage for rate tracking.
           3. Blocks (sleeps) if both models are exhausted.
+        If the API returns a real 429 despite our local tracking, the used model
+        is force-exhausted and the limiter immediately re-tries with the other.
         """
         model_name = GEMINI_EMBEDDING_LIMITER.wait_and_get_model(texts)
         model_obj  = self._get_model(model_name)
         logger.debug(f"Embedding {len(texts)} texts with {model_name}")
-        return model_obj.embed_documents(texts)
+        try:
+            return model_obj.embed_documents(texts)
+        except Exception as e:
+            msg = str(e).lower()
+            if any(k in msg for k in ("429", "resource_exhausted", "quota")):
+                # Real quota hit — force the limiter to switch to the other model
+                logger.warning(
+                    f"Real 429 from {model_name}; force-exhausting and retrying. Error: {e}"
+                )
+                GEMINI_EMBEDDING_LIMITER.force_exhaust_model(model_name)
+                # Re-select model and retry immediately (tenacity will catch further failures)
+                model_name2 = GEMINI_EMBEDDING_LIMITER.wait_and_get_model(texts)
+                model_obj2  = self._get_model(model_name2)
+                logger.info(f"Retrying embedding with {model_name2}")
+                return model_obj2.embed_documents(texts)
+            raise
 
     def embed_documents(
         self,

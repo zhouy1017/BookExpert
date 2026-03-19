@@ -255,6 +255,23 @@ class GeminiEmbeddingLimiter:
     def _estimate_tokens(self, texts: List[str]) -> int:
         return max(1, sum(len(t) for t in texts) // _CHARS_PER_TOKEN)
 
+    def force_exhaust_model(self, model_name: str):
+        """
+        Mark a model's RPM bucket as full for the next 60 s.
+        Call this when the API returns a real 429/RESOURCE_EXHAUSTED so the
+        limiter immediately routes the next request to the other model.
+        """
+        bucket = (
+            self._primary if model_name == self._primary.model_name
+            else self._fallback
+        )
+        with bucket._lock:
+            now = time.monotonic()
+            # Flood the sliding window with fake timestamps to saturate RPM
+            while len(bucket._req_times) < bucket.rpm:
+                bucket._req_times.append(now)
+        logger.warning(f"GeminiLimiter: force-exhausted {model_name}")
+
     def wait_and_get_model(self, texts: List[str]) -> str:
         """Block until a model slot is available; returns model name to use."""
         token_estimate = self._estimate_tokens(texts)
@@ -308,6 +325,9 @@ GEMINI_EMBEDDING_LIMITER = GeminiEmbeddingLimiter(
 )
 
 DEEPSEEK_LIMITER = RateLimiter(rpm=50)
+
+# Gemini chat model limiter (free-tier: 15 RPM for gemini-3.x-flash-lite)
+GEMINI_LLM_LIMITER = RateLimiter(rpm=15)
 
 # Backward-compatible alias
 GOOGLE_LIMITER = RateLimiter(rpm=100)
