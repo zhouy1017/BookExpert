@@ -1,22 +1,22 @@
 # Indexing and Embedding Generation
+# Supports dual-model Gemini embedding with sliding-window rate limiting.
 
-import os
 import logging
+import os
 from typing import Callable, List, Optional
 
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
-from src.rate_limiter import GOOGLE_LIMITER, retry_on_rate_limit
+from src.rate_limiter import GEMINI_EMBEDDING_LIMITER, retry_on_rate_limit
 
 logger = logging.getLogger(__name__)
 
-# How many texts to embed per single API call (keeps request payloads small)
+# Texts per single API call — keeps payloads small and token estimates accurate
 _EMBED_BATCH_SIZE = 5
 
 
 class Indexer:
     def __init__(self):
-        # Load API key from d:/BookExpert/google.apikey
         try:
             with open("d:/BookExpert/google.apikey", "r", encoding="utf-8") as f:
                 self.api_key = f.read().strip().rstrip(".")
@@ -25,17 +25,37 @@ class Indexer:
             logger.error("Could not read google.apikey")
             raise e
 
-        logger.info("Initializing Google Generative AI Embeddings (gemini-embedding-001)")
-        self.embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/gemini-embedding-001",
-            google_api_key=self.api_key
-        )
+        # Both embedding model instances are created up-front;
+        # GeminiEmbeddingLimiter decides which one to use at call time.
+        logger.info("Initializing Gemini embedding models (primary + fallback)")
+        self._model_instances = {
+            "models/gemini-embedding-001": GoogleGenerativeAIEmbeddings(
+                model="models/gemini-embedding-001",
+                google_api_key=self.api_key,
+            ),
+            "models/gemini-embedding-002": GoogleGenerativeAIEmbeddings(
+                model="models/gemini-embedding-002",
+                google_api_key=self.api_key,
+            ),
+        }
+        # Default embeddings object (used for embed_query compatibility)
+        self.embeddings = self._model_instances["models/gemini-embedding-001"]
 
-    @retry_on_rate_limit(max_attempts=6, wait_min=5, wait_max=90)
+    def _get_model(self, model_name: str) -> GoogleGenerativeAIEmbeddings:
+        return self._model_instances.get(model_name, self.embeddings)
+
+    @retry_on_rate_limit(max_attempts=8, wait_min=5, wait_max=120)
     def _embed_batch(self, texts: List[str]) -> List[List[float]]:
-        """Embed a small batch — the rate limiter waits before the call."""
-        GOOGLE_LIMITER.wait()
-        return self.embeddings.embed_documents(texts)
+        """
+        Embed a batch of texts. GeminiEmbeddingLimiter:
+          1. Picks the model (primary or fallback) that has quota.
+          2. Records the usage for rate tracking.
+          3. Blocks (sleeps) if both models are exhausted.
+        """
+        model_name = GEMINI_EMBEDDING_LIMITER.wait_and_get_model(texts)
+        model_obj  = self._get_model(model_name)
+        logger.debug(f"Embedding {len(texts)} texts with {model_name}")
+        return model_obj.embed_documents(texts)
 
     def embed_documents(
         self,
@@ -45,22 +65,19 @@ class Indexer:
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> List[List[float]]:
         """
-        Embed texts with optional caching and progress reporting.
+        Embed texts with optional cache and progress reporting.
 
         Parameters
         ----------
         texts            : list of text strings to embed
-        file_hash        : SHA-256 of the source file; used as cache key
+        file_hash        : SHA-256 of source file; used as cache key
         embedding_cache  : EmbeddingCache instance; skips API if hit
-        progress_callback: called as (completed: int, total: int) after each batch
+        progress_callback: called as (completed, total) after each batch
         """
         total = len(texts)
-        logger.info(
-            f"Generating embeddings for {total} chunks "
-            f"(batches of {_EMBED_BATCH_SIZE}, ~{60/_EMBED_BATCH_SIZE:.0f}s/batch at 15 RPM)"
-        )
+        logger.info(f"Embedding {total} chunks (batch={_EMBED_BATCH_SIZE})")
 
-        all_vectors: List[List[float]] = [None] * total
+        all_vectors: List[Optional[List[float]]] = [None] * total
 
         # --- Fill from cache first ---
         uncached_indices: List[int] = []
@@ -71,23 +88,22 @@ class Indexer:
                     all_vectors[i] = vec
                 else:
                     uncached_indices.append(i)
-            if len(uncached_indices) < total:
-                logger.info(
-                    f"  Embedding cache: {total - len(uncached_indices)}/{total} chunks reused, "
-                    f"{len(uncached_indices)} need API calls."
-                )
+            cached_count = total - len(uncached_indices)
+            if cached_count:
+                logger.info(f"  Cache hit: {cached_count}/{total} chunks reused.")
         else:
             uncached_indices = list(range(total))
 
-        # --- API calls for uncached chunks ---
+        # --- Report cache-filled progress ---
         completed = total - len(uncached_indices)
         if progress_callback:
             progress_callback(completed, total)
 
+        # --- API calls for uncached chunks ---
         for batch_start in range(0, len(uncached_indices), _EMBED_BATCH_SIZE):
-            batch_idxs = uncached_indices[batch_start: batch_start + _EMBED_BATCH_SIZE]
+            batch_idxs  = uncached_indices[batch_start: batch_start + _EMBED_BATCH_SIZE]
             batch_texts = [texts[i] for i in batch_idxs]
-            vectors = self._embed_batch(batch_texts)
+            vectors     = self._embed_batch(batch_texts)
 
             for local_i, global_i in enumerate(batch_idxs):
                 all_vectors[global_i] = vectors[local_i]
@@ -95,14 +111,14 @@ class Indexer:
                     embedding_cache.put(file_hash, global_i, vectors[local_i])
 
             completed += len(batch_idxs)
-            logger.info(f"  Embedded {completed}/{total} chunks")
+            logger.info(f"  Embedded {completed}/{total}")
             if progress_callback:
                 progress_callback(completed, total)
 
         return all_vectors
 
-    @retry_on_rate_limit(max_attempts=6, wait_min=5, wait_max=60)
+    @retry_on_rate_limit(max_attempts=8, wait_min=5, wait_max=60)
     def embed_query(self, query: str) -> List[float]:
-        """Embed a single query string with rate limiting."""
-        GOOGLE_LIMITER.wait()
-        return self.embeddings.embed_query(query)
+        """Embed a single query string using the rate limiter."""
+        model_name = GEMINI_EMBEDDING_LIMITER.wait_and_get_model([query])
+        return self._get_model(model_name).embed_query(query)

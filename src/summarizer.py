@@ -1,4 +1,4 @@
-# Map-Reduce Summarization and QA via DeepSeek
+# Map-Reduce Summarization and QA via DeepSeek — RAG-first design
 import os
 import logging
 from typing import Any, Dict, List, Optional
@@ -12,6 +12,16 @@ logger = logging.getLogger(__name__)
 
 # Truncate individual chunks for the map step to avoid hitting context window limits
 _MAX_CHUNK_CHARS = 8000
+
+# Broad summary seed queries — used for RAG-guided summarization
+_SUMMARY_QUERIES = [
+    "主要人物 故事情节 关键事件",
+    "核心主题 思想内涵 中心思想",
+    "故事背景 时代环境 社会背景",
+    "结局 高潮 转折点",
+    "作者观点 价值观 启示",
+]
+_SUMMARY_CHUNKS_PER_QUERY = 10
 
 
 class BookSummarizer:
@@ -32,31 +42,88 @@ class BookSummarizer:
         )
 
     # ------------------------------------------------------------------
-    # Map-Reduce Summarization
+    # RAG-Guided Map-Reduce Summarization
     # ------------------------------------------------------------------
-    def summarize_large_document(
+    def rag_summarize(
         self,
-        texts: List[str],
-        batch_size: int = 20,
+        doc_name: str,
+        searcher: Any,
+        top_k: int = 40,
+        batch_size: int = 10,
         file_hash: Optional[str] = None,
         summary_cache=None,
     ) -> str:
         """
-        Map-Reduce summarization over a list of text chunks.
+        RAG-guided summarization: retrieves the most relevant chunks from the
+        indexed corpus using broad seed queries, then runs map-reduce only on
+        those chunks. Falls back to full-chunk summarization if fewer than 10
+        chunks are in the index.
 
-        Checks SummaryCache first using key ``summary_{file_hash}`` if provided.
-        Writes the result back to cache after computation.
+        Parameters
+        ----------
+        doc_name     : indexed document name
+        searcher     : HybridSearcher instance
+        top_k        : max total chunks to retrieve
+        batch_size   : chunks per reduce batch
+        file_hash    : stable hash for caching
+        summary_cache: SummaryCache instance
         """
-        if not texts:
-            return "No text to summarize."
+        if not doc_name:
+            return "No document specified."
 
         # --- Cache read ---
         cache_key = f"summary_{file_hash}" if file_hash else None
         if cache_key and summary_cache:
             cached = summary_cache.get(cache_key)
             if cached:
-                logger.info("Summary cache hit — returning stored summary.")
+                logger.info(f"Summary cache hit for '{doc_name}'")
                 return cached
+
+        # --- RAG retrieval from indexed corpus ---
+        seen_ids: set = set()
+        retrieved_texts: List[str] = []
+
+        per_query = max(4, top_k // len(_SUMMARY_QUERIES))
+        for query in _SUMMARY_QUERIES:
+            try:
+                results = searcher.search(query, limit=per_query, doc_filter=[doc_name])
+                for r in results:
+                    cid = r.get("chunk_id", r["text"][:40])
+                    if cid not in seen_ids:
+                        seen_ids.add(cid)
+                        retrieved_texts.append(r["text"])
+                        if len(retrieved_texts) >= top_k:
+                            break
+            except Exception as e:
+                logger.warning(f"RAG retrieval error for summary query '{query}': {e}")
+            if len(retrieved_texts) >= top_k:
+                break
+
+        # Fallback: not enough retrieved chunks — use stored chunks directly
+        if len(retrieved_texts) < 10:
+            logger.info(f"RAG retrieved only {len(retrieved_texts)} chunks for '{doc_name}'; "
+                        "falling back to full chunk list.")
+            retrieved_texts = searcher.get_chunks_for_doc(doc_name)
+
+        if not retrieved_texts:
+            return f"未在索引中找到《{doc_name}》的内容，请先完成索引后再生成摘要。"
+
+        logger.info(f"[MAP-REDUCE] Summarizing {len(retrieved_texts)} RAG-retrieved chunks for '{doc_name}'")
+        result = self.summarize_large_document(retrieved_texts, batch_size=batch_size)
+
+        # --- Cache write ---
+        if cache_key and summary_cache:
+            summary_cache.put(cache_key, result)
+
+        return result
+
+    def summarize_large_document(self, texts: List[str], batch_size: int = 20) -> str:
+        """
+        Core Map-Reduce summarization over a list of text strings.
+        Called by rag_summarize with pre-filtered RAG chunks.
+        """
+        if not texts:
+            return "No text to summarize."
 
         logger.info(f"[MAP] Summarizing {len(texts)} chunks in batches of {batch_size}...")
 
@@ -72,7 +139,7 @@ class BookSummarizer:
 
         logger.info(f"[REDUCE] Reducing {len(intermediate_summaries)} intermediate summaries...")
 
-        # REDUCE step — recursively reduce until single summary
+        # REDUCE step
         while len(intermediate_summaries) > 1:
             next_level: List[str] = []
             for i in range(0, len(intermediate_summaries), batch_size):
@@ -83,13 +150,7 @@ class BookSummarizer:
             intermediate_summaries = next_level
             logger.info(f"  Reduce pass produced {len(intermediate_summaries)} summaries.")
 
-        result = intermediate_summaries[0] if intermediate_summaries else "Could not generate summary."
-
-        # --- Cache write ---
-        if cache_key and summary_cache:
-            summary_cache.put(cache_key, result)
-
-        return result
+        return intermediate_summaries[0] if intermediate_summaries else "Could not generate summary."
 
     # ------------------------------------------------------------------
     # Multi-Turn QA with full conversation history + optional attachment
@@ -102,48 +163,47 @@ class BookSummarizer:
         attachment_text: str = "",
     ) -> str:
         """
-        Answer a question using retrieved context, full conversation history,
-        and an optional in-chat file attachment.
+        Answer a question using retrieved context from the indexed corpus,
+        the full conversation history, and an optional in-chat file attachment.
 
         Parameters
         ----------
         query          : the new user question
-        context_chunks : list of dicts with 'text', 'doc_name', 'score'
-        history        : list of {role: "user"|"assistant", content: str} dicts
-                         representing prior turns (oldest first)
-        attachment_text: raw text extracted from a chat-attached file
+        context_chunks : retrieved dicts with 'text', 'doc_name', 'score' (from HybridSearcher)
+        history        : list of {role, content} dicts — full prior turns (oldest first)
+        attachment_text: text from a per-conversation chat attachment (not indexed)
         """
         if not context_chunks and not attachment_text:
-            return "No relevant context found in the book to answer your question."
+            return "在已索引的书籍中未找到相关信息，请先上传并索引书籍，或上传附件进行提问。"
 
         history = history or []
 
-        # --- Build context string from retrieved book chunks ---
+        # Build book context from RAG results
         book_context = "\n\n".join([
-            f"Excerpt from '{c.get('doc_name', 'book')}' (Score: {c.get('score', 0):.2f}):\n{c['text']}"
+            f"来自《{c.get('doc_name', '书籍')}》(相关度 {c.get('score', 0):.2f}):\n{c['text']}"
             for c in context_chunks
         ]) if context_chunks else ""
 
-        # --- Compose messages ---
+        # Compose messages
         messages = []
 
-        # 1. System: role definition
+        # 1. System: role
         messages.append(SystemMessage(content=(
-            "你是书籍专家（BookExpert），一位精通书籍内容的中文AI助手，能进行多轮对话。"
-            "请仅根据提供的书籍摘录和附件内容用简体中文回答用户的问题。"
-            "若内容中未包含答案，请直接说明无法从书中找到相关信息。"
+            "你是书籍专家（BookExpert），一位精通书籍内容的中文AI助手，能进行多轮深度对话。"
+            "请仅根据提供的书籍索引摘录和用户附件用简体中文回答问题。"
+            "若内容中未包含答案，请直接告知，不要编造信息。"
         )))
 
-        # 2. System: book context (if any)
+        # 2. System: book context from indexed corpus
         if book_context:
-            messages.append(SystemMessage(content=f"--- 书籍相关摘录 ---\n{book_context}"))
+            messages.append(SystemMessage(content=f"--- 索引库相关摘录 ---\n{book_context}"))
 
-        # 3. System: attachment context (if any)
+        # 3. System: attachment (session-only, not indexed)
         if attachment_text:
-            snippet = attachment_text[:12000]  # guard context window
-            messages.append(SystemMessage(content=f"--- 📎 用户附件内容（仅本会话有效）---\n{snippet}"))
+            snippet = attachment_text[:12000]
+            messages.append(SystemMessage(content=f"--- 📎 用户附件（仅本会话，未入书库）---\n{snippet}"))
 
-        # 4. Full conversation history
+        # 4. Full history
         for turn in history:
             role = turn.get("role", "user")
             content = turn.get("content", "")
@@ -156,19 +216,22 @@ class BookSummarizer:
         messages.append(HumanMessage(content=query))
 
         logger.info(
-            f"Answering question with {len(context_chunks)} chunks, "
-            f"{len(history)} history turns, attachment={'yes' if attachment_text else 'no'}."
+            f"Answering: {len(context_chunks)} RAG chunks, "
+            f"{len(history)} history turns, attachment={'yes' if attachment_text else 'no'}"
         )
         return self._invoke_with_messages(messages)
 
     # ------------------------------------------------------------------
-    # Internal rate-limited + retry-wrapped LLM invocations
+    # Rate-limited LLM calls
     # ------------------------------------------------------------------
     @retry_on_rate_limit(max_attempts=6, wait_min=5, wait_max=90)
     def _invoke_map(self, chunk: str) -> str:
         DEEPSEEK_LIMITER.wait()
         messages = [
-            SystemMessage(content="你是一位书籍分析专家，请用简体中文简要总结以下书籍段落，重点提炼关键事件、人物和核心思想。"),
+            SystemMessage(content=(
+                "你是一位书籍分析专家，请用简体中文简要总结以下书籍段落，"
+                "重点提炼关键事件、人物和核心思想。"
+            )),
             HumanMessage(content=chunk),
         ]
         return self.llm.invoke(messages).content
@@ -177,7 +240,10 @@ class BookSummarizer:
     def _invoke_reduce(self, summaries: str) -> str:
         DEEPSEEK_LIMITER.wait()
         messages = [
-            SystemMessage(content="你是一位书籍分析专家。你将收到一本书各段落的摘要。请用简体中文将它们整合成一份完整、连贯的全书摘要。"),
+            SystemMessage(content=(
+                "你是一位书籍分析专家。你将收到一本书各段落的摘要。"
+                "请用简体中文将它们整合成一份完整、连贯的全书摘要。"
+            )),
             HumanMessage(content=summaries),
         ]
         return self.llm.invoke(messages).content

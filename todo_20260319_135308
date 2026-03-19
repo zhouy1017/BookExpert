@@ -1,0 +1,10 @@
+the critic content is too simple, we need more professional and enriched content in critic part.
+Change the prompt for that part.
+
+to prevent inconsistency, for a same book, the rating scores (including sub-scores) should remain the same when re-generating critics.
+
+add a feedback feature in cirtic section: the user could input the scores and the strengths/weakness and even provide comments and feedbacks on critics. Then the system will re-generate the critic content based on the user's feedback. And remember the scoring preferences inputed, use it to make further ratings.
+
+when indexing, we need a process bar to show the progress.  And the indexing should be able to run in background and not be interrupted by switching tab or conversation.  The chatbot should be able to work concurrently as well.
+
+I noticed that the QA system and cirtic system could work before indexing is completed, is this a designed behavior?

@@ -25,3 +25,4 @@ SQLAlchemy>=2.0.25 # Metadata DB
 python-dotenv>=1.0.1
 pydantic>=2.6.0
 loguru>=0.7.2
+streamlit-autorefresh>=0.0.1
